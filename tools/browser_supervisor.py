@@ -363,8 +363,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
-        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
-            SUPERVISOR_REGISTRY._pop(self.task_id)
+        SUPERVISOR_REGISTRY._discard(self)  # by identity: this thread has no profile scope to key by
         return True
 
     async def _run(self) -> None:
@@ -499,21 +498,36 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
 
 
 class _SupervisorRegistry:
-    """Process-global (task_id → supervisor) map with idempotent start/stop (``SUPERVISOR_REGISTRY``)."""
+    """Process-global (task_id → supervisor) map with idempotent start/stop (``SUPERVISOR_REGISTRY``).
+
+    Under a served-profile scope the key is ``task_id@<home key>``, so profiles of a multiplexed
+    gateway that use the same task id (``"default"``, a cron or kanban id) never share or replace
+    each other's supervisor; outside one it is the plain ``task_id`` (#110032)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._by_task: dict[str, CDPSupervisor] = {}
         self._home_by_task: dict[str, str] = {}  # profile home that started it (``stop_home``)
 
+    @staticmethod
+    def _key(task_id: str) -> str:
+        from hermes_constants import get_hermes_home_override, hermes_home_key
+        return task_id if get_hermes_home_override() is None else f"{task_id}@{hermes_home_key()}"
+
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
-            return self._by_task.get(task_id)
+            return self._by_task.get(self._key(task_id))
 
-    def _pop(self, task_id: str) -> Optional[CDPSupervisor]:
+    def _pop(self, key: str) -> Optional[CDPSupervisor]:
         with self._lock:
-            self._home_by_task.pop(task_id, None)
-            return self._by_task.pop(task_id, None)
+            self._home_by_task.pop(key, None)
+            return self._by_task.pop(key, None)
+
+    def _discard(self, supervisor: CDPSupervisor) -> None:
+        with self._lock:
+            for key in [key for key, entry in self._by_task.items() if entry is supervisor]:
+                self._by_task.pop(key)
+                self._home_by_task.pop(key, None)
 
     def capture(self, task_id: str, *, timeout: float = 10.0) -> CapturedCDP:
         """Public CDP seam for trusted in-process plugins: a handle pinned to this task's
@@ -527,15 +541,15 @@ class _SupervisorRegistry:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
         different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
         from hermes_constants import hermes_home_key
-        home = hermes_home_key()
+        home, key = hermes_home_key(), self._key(task_id)
         with self._lock:
-            existing = self._by_task.get(task_id)
+            existing = self._by_task.get(key)
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
                 if existing.cdp_url == cdp_url and healthy:
                     return existing
-                self._by_task.pop(task_id, None)
+                self._by_task.pop(key, None)
         if existing is not None:
             existing.stop()
 
@@ -544,25 +558,27 @@ class _SupervisorRegistry:
         supervisor.start(timeout=start_timeout)
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
-            already = self._by_task.get(task_id)
+            already = self._by_task.get(key)
             if already is not None and already.cdp_url == cdp_url:
                 supervisor.stop()
                 return already
-            self._by_task[task_id] = supervisor
-            self._home_by_task[task_id] = home
+            self._by_task[key] = supervisor
+            self._home_by_task[key] = home
         return supervisor
 
     def stop(self, task_id: str) -> None:
-        supervisor = self._pop(task_id)
+        supervisor = self._pop(self._key(task_id))
         if supervisor is not None:
             supervisor.stop()
 
     def stop_home(self, home_key: str) -> None:
         """Stop the supervisors one profile home started (``/browser connect`` on a multiplexed gateway)."""
         with self._lock:
-            tasks = [task for task, home in self._home_by_task.items() if home == home_key]
-        for task_id in tasks:
-            self.stop(task_id)
+            keys = [key for key, home in self._home_by_task.items() if home == home_key]
+        for key in keys:
+            supervisor = self._pop(key)
+            if supervisor is not None:
+                supervisor.stop()
 
     def stop_all(self) -> None:
         """Stop every running supervisor. For shutdown / test teardown."""
