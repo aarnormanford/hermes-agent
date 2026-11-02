@@ -1095,7 +1095,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, report_ownership_refusal: bool = True) -> bool:
+    turn_author: dict | None = None, report_ownership_refusal: bool = True,
+    human_turn: Any = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1139,6 +1140,17 @@ def _run_prompt_submit(
         # before any tool can commission a child (delegate_task captures it as authority).
         transport_token = bind_transport(session.get("transport"))
         runtime_session_token = _current_runtime_session_record.set(session)
+        # Only prompt.submit mints a HumanTurn; every other caller of this runner passes None.
+        from agent.human_turn import enter_human_turn, exit_human_turn
+        live_turn = human_turn
+        if live_turn is not None and session.get("session_key"):
+            # A queued turn may drain after compression rotated the key: name the session it runs in,
+            # the same key _prepare_turn_input binds as the gateway session context.
+            import dataclasses
+            live_turn = dataclasses.replace(live_turn, session_id=str(session["session_key"]))
+        human_binding = enter_human_turn(live_turn) if live_turn is not None else None
+        if human_binding is not None:
+            session["_human_turn_binding"] = human_binding
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
@@ -1175,6 +1187,9 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            if human_binding is not None:
+                session.pop("_human_turn_binding", None)
+            exit_human_turn(human_binding)
             _release_turn_scopes(sid, session, st)
             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
                 _current_runtime_session_record.reset(runtime_session_token)

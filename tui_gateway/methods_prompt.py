@@ -669,7 +669,8 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
 
 
 def _run_after_agent_ready(
-    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None
+    rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
+    human_turn=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -700,7 +701,43 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, human_turn=human_turn)
+
+
+def _human_turn_for_submit(session, params, turn_author, internal_hosted_submit, display_kind):
+    """A :class:`agent.human_turn.HumanTurn` for a prompt a person typed in the app, else None.
+
+    Only a ``prompt.submit`` frame the RPC dispatcher read from a WebSocket qualifies: the socket passed
+    the dashboard's upgrade authentication (session token, ticket or native grant), and the dispatcher
+    names the method it is serving, so a handler calling ``_methods["prompt.submit"]`` in-process
+    (onboarding, bot relay, hosted rooms) never matches. Relayed, hosted and hidden sends never qualify;
+    stdio (``hermes --tui``) has no authenticated transport. JSON cannot supply one: the contract
+    refuses unknown keys and this handler never reads one from ``params``."""
+    if turn_author is not None or internal_hosted_submit or display_kind is not None:
+        return None
+    if _current_rpc_method.get() != "prompt.submit":
+        return None
+    from tui_gateway.ws import WSTransport
+    transport = current_transport()
+    if not isinstance(transport, WSTransport):
+        return None
+    import uuid
+    from agent.human_turn import HumanTurn
+    from hermes_constants import profile_name_for_home
+    identity = transport.auth_identity if isinstance(transport.auth_identity, dict) else None
+    principal = ({k: str(identity[k]) for k in ("user_id", "provider", "issuer") if identity.get(k)}
+                 if identity else {"provider": "dashboard-session-token"})
+    return HumanTurn(
+        session_id=str(session.get("session_key") or ""), turn_id=uuid.uuid4().hex,
+        profile=profile_name_for_home(session.get("profile_home")) or _current_profile_name(),
+        surface=_session_source(session), transport="websocket", principal=principal)
+
+
+def _revoke_live_human_turn(session):
+    """Input that is not the person's own may be steered into the live turn: it stops being theirs."""
+    binding = session.get("_human_turn_binding")
+    if binding is not None:
+        binding.revoke()
 
 
 _TRUNCATION_PARAMS = (
@@ -852,6 +889,7 @@ def _(rid, params: dict) -> dict:
         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
     if err is not None:
         return err
+    human_turn = _human_turn_for_submit(session, params, turn_author, internal_hosted_submit, display_kind)
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         # Refused HERE — before the busy queue, db row and agent build — so a refusal
         # leaves the session untouched.  The reason travels as machine-readable data.
@@ -900,9 +938,11 @@ def _(rid, params: dict) -> dict:
             # built for exactly this race — see desktop's `runRewindSubmit`) waits
             # for `running` to clear and resubmits with the truncation intact.
             return _err(rid, 4009, "session busy")
+        if human_turn is None:
+            _revoke_live_human_turn(session)
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind)
+            display_kind=display_kind, human_turn=human_turn)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -958,7 +998,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
+            human_turn),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
